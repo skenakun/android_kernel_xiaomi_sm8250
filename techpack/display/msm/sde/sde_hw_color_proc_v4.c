@@ -3,6 +3,7 @@
  * Copyright (c) 2017-2019, The Linux Foundation. All rights reserved.
  * Copyright (c) 2018, Pal Zoltan Illes (tbalden) - kcal rgb
  */
+#include <linux/atomic.h>
 #include <linux/moduleparam.h>
 #include <drm/msm_drm_pp.h>
 #include "sde_hw_color_proc_common_v4.h"
@@ -16,13 +17,80 @@ static unsigned short kcal_sat = 255;
 static unsigned short kcal_val = 255;
 static unsigned short kcal_cont = 255;
 
-module_param(kcal_red, short, 0644);
-module_param(kcal_green, short, 0644);
-module_param(kcal_blue, short, 0644);
-module_param(kcal_hue, short, 0644);
-module_param(kcal_sat, short, 0644);
-module_param(kcal_val, short, 0644);
-module_param(kcal_cont, short, 0644);
+/* A sysfs write is consumed by each CRTC on its next atomic commit. */
+static atomic_t kcal_generation = ATOMIC_INIT(1);
+
+static int kcal_param_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned short value;
+	unsigned short *target = kp->arg;
+	int ret = kstrtou16(val, 0, &value);
+
+	if (ret)
+		return ret;
+	if (target == &kcal_red || target == &kcal_green || target == &kcal_blue) {
+		if (value < 20 || value > 256)
+			return -EINVAL;
+	} else if (target == &kcal_hue) {
+		if (value > 1536)
+			return -EINVAL;
+	} else if (value < 128 || value > 383) {
+		return -EINVAL;
+	}
+
+	if (READ_ONCE(*target) != value) {
+		WRITE_ONCE(*target, value);
+		atomic_inc(&kcal_generation);
+	}
+	return 0;
+}
+
+static const struct kernel_param_ops kcal_param_ops = {
+	.set = kcal_param_set,
+	.get = param_get_ushort,
+};
+
+module_param_cb(kcal_red, &kcal_param_ops, &kcal_red, 0644);
+module_param_cb(kcal_green, &kcal_param_ops, &kcal_green, 0644);
+module_param_cb(kcal_blue, &kcal_param_ops, &kcal_blue, 0644);
+module_param_cb(kcal_hue, &kcal_param_ops, &kcal_hue, 0644);
+module_param_cb(kcal_sat, &kcal_param_ops, &kcal_sat, 0644);
+module_param_cb(kcal_val, &kcal_param_ops, &kcal_val, 0644);
+module_param_cb(kcal_cont, &kcal_param_ops, &kcal_cont, 0644);
+
+u32 sde_kcal_generation(void)
+{
+	return atomic_read(&kcal_generation);
+}
+
+/* Merge into the real HSIC payload, before either AHB or REG_DMA writes it.
+ * Default KCAL channels leave the corresponding vendor setting intact.
+ * Keep the existing KCAL ABI: PA values are raw encoded register values.
+ */
+void sde_kcal_merge_hsic(struct drm_msm_pa_hsic *hsic)
+{
+	u32 hue = READ_ONCE(kcal_hue);
+	u32 sat = READ_ONCE(kcal_sat);
+	u32 val = READ_ONCE(kcal_val);
+	u32 cont = READ_ONCE(kcal_cont);
+
+	if (hue) {
+		hsic->flags |= PA_HSIC_HUE_ENABLE;
+		hsic->hue = hue;
+	}
+	if (sat != 255) {
+		hsic->flags |= PA_HSIC_SAT_ENABLE;
+		hsic->saturation = sat;
+	}
+	if (val != 255) {
+		hsic->flags |= PA_HSIC_VAL_ENABLE;
+		hsic->value = val;
+	}
+	if (cont != 255) {
+		hsic->flags |= PA_HSIC_CONT_ENABLE;
+		hsic->contrast = cont;
+	}
+}
 
 static int sde_write_3d_gamut(struct sde_hw_blk_reg_map *hw,
 		struct drm_msm_3d_gamut *payload, u32 base,
@@ -221,38 +289,33 @@ void sde_setup_dspp_pccv4(struct sde_hw_dspp *ctx, void *cfg)
 	struct drm_msm_pcc *pcc_cfg;
 	struct drm_msm_pcc_coeff *coeffs = NULL;
 	int i = 0;
-	int kcal_min = 20;
+	struct drm_msm_pcc identity = {
+		.r.r = 1 << 15, .g.g = 1 << 15, .b.b = 1 << 15,
+	};
+	u32 red = READ_ONCE(kcal_red);
+	u32 green = READ_ONCE(kcal_green);
+	u32 blue = READ_ONCE(kcal_blue);
 	u32 base = 0;
-	u32 opcode = 0, local_opcode = 0;
 
 	if (!ctx || !cfg) {
 		DRM_ERROR("invalid param ctx %pK cfg %pK\n", ctx, cfg);
 		return;
 	}
 
-	if (kcal_red < kcal_min)
-		kcal_red = kcal_min;
-	if (kcal_green < kcal_min)
-		kcal_green = kcal_min;
-	if (kcal_blue < kcal_min)
-		kcal_blue = kcal_min;
-
 	if (!hw_cfg->payload) {
-		DRM_DEBUG_DRIVER("disable pcc feature\n");
-		SDE_REG_WRITE(&ctx->hw, ctx->cap->sblk->pcc.base, 0);
-		return;
-	}
-
-	if (hw_cfg->len != sizeof(struct drm_msm_pcc)) {
-		DRM_ERROR("invalid size of payload len %d exp %zd\n",
-				hw_cfg->len, sizeof(struct drm_msm_pcc));
-		return;
-	}
-
-	if (hw_cfg->payload_clear) {
-		pcc_cfg = hw_cfg->payload_clear;
+		if (red == 256 && green == 256 && blue == 256) {
+			SDE_REG_WRITE(&ctx->hw, ctx->cap->sblk->pcc.base, 0);
+			return;
+		}
+		/* HWC can disable PCC at its identity transform. KCAL still works. */
+		pcc_cfg = &identity;
 	} else {
-		pcc_cfg = hw_cfg->payload;
+		if (hw_cfg->len != sizeof(struct drm_msm_pcc)) {
+			DRM_ERROR("invalid pcc payload length %d\n", hw_cfg->len);
+			return;
+		}
+		pcc_cfg = hw_cfg->payload_clear ? hw_cfg->payload_clear :
+			hw_cfg->payload;
 	}
 
 	for (i = 0; i < PCC_NUM_PLANES; i++) {
@@ -292,46 +355,21 @@ void sde_setup_dspp_pccv4(struct sde_hw_dspp *ctx, void *cfg)
 
 		SDE_REG_WRITE(&ctx->hw, base + PCC_C_OFF, coeffs->c);
 
-		// RED
+		/* RED */
 		SDE_REG_WRITE(&ctx->hw, base + PCC_R_OFF,
-			i == 0 ? (coeffs->r * kcal_red) / 256 : coeffs->r);
-		// GREEN
+			i == 0 ? (coeffs->r * red) / 256 : coeffs->r);
+		/* GREEN */
 		SDE_REG_WRITE(&ctx->hw, base + PCC_G_OFF,
-			i == 1 ? (coeffs->g * kcal_green) / 256 : coeffs->g);
-		// BLUE
+			i == 1 ? (coeffs->g * green) / 256 : coeffs->g);
+		/* BLUE */
 		SDE_REG_WRITE(&ctx->hw, base + PCC_B_OFF,
-			i == 2 ? (coeffs->b * kcal_blue) / 256 : coeffs->b);
+			i == 2 ? (coeffs->b * blue) / 256 : coeffs->b);
 
 		SDE_REG_WRITE(&ctx->hw, base + PCC_RG_OFF, coeffs->rg);
 		SDE_REG_WRITE(&ctx->hw, base + PCC_RB_OFF, coeffs->rb);
 		SDE_REG_WRITE(&ctx->hw, base + PCC_GB_OFF, coeffs->gb);
 		SDE_REG_WRITE(&ctx->hw, base + PCC_RGB_OFF, coeffs->rgb);
 	}
-
-	opcode = SDE_REG_READ(&ctx->hw, ctx->cap->sblk->hsic.base);
-
-	// HUE
-	SDE_REG_WRITE(&ctx->hw, ctx->cap->sblk->hsic.base + PA_HUE_OFF,
-		kcal_hue & PA_HUE_MASK);
-	local_opcode |= PA_HUE_EN;
-
-	// SATURATION
-	SDE_REG_WRITE(&ctx->hw, ctx->cap->sblk->hsic.base + PA_SAT_OFF,
-		kcal_sat & PA_SAT_MASK);
-	local_opcode |= PA_SAT_EN;
-
-	// VALUE
-	SDE_REG_WRITE(&ctx->hw, ctx->cap->sblk->hsic.base + PA_VAL_OFF,
-		kcal_val & PA_VAL_MASK);
-	local_opcode |= PA_VAL_EN;
-
-	// CONTRAST
-	SDE_REG_WRITE(&ctx->hw, ctx->cap->sblk->hsic.base + PA_CONT_OFF,
-		kcal_cont & PA_CONT_MASK);
-	local_opcode |= PA_CONT_EN;
-
-	opcode |= (local_opcode | PA_EN);
-	SDE_REG_WRITE(&ctx->hw, ctx->cap->sblk->hsic.base, opcode);
 
 	SDE_REG_WRITE(&ctx->hw, ctx->cap->sblk->pcc.base, PCC_EN);
 }

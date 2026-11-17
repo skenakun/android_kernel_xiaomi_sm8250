@@ -8,6 +8,11 @@
 #include "sde_hw_util.h"
 #include "sde_hw_catalog.h"
 #include "sde_hw_dspp.h"
+
+struct drm_msm_pa_hsic;
+u32 sde_kcal_generation(void);
+void sde_kcal_merge_hsic(struct drm_msm_pa_hsic *hsic);
+
 /**
  * sde_setup_dspp_3d_gamutv4 - Function for 3d gamut v4 version feature
  *                             programming.

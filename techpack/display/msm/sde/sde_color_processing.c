@@ -19,10 +19,12 @@
 #include "sde_core_irq.h"
 #include "dsi_panel.h"
 #include "sde_hw_color_proc_common_v4.h"
+#include "sde_hw_color_proc_v4.h"
 #include "sde_connector.h"
 
 struct sde_cp_node {
 	u32 property_id;
+	u32 kcal_generation;
 	u32 prop_flags;
 	u32 feature;
 	void *blob_ptr;
@@ -335,14 +337,21 @@ static int set_dspp_hsic_feature(struct sde_hw_dspp *hw_dspp,
 				 struct sde_hw_cp_cfg *hw_cfg,
 				 struct sde_crtc *hw_crtc)
 {
-	int ret = 0;
+	struct drm_msm_pa_hsic hsic = { 0 };
+	struct sde_hw_cp_cfg cfg = *hw_cfg;
 
 	if (!hw_dspp || !hw_dspp->ops.setup_pa_hsic)
-		ret = -EINVAL;
-	else
-		hw_dspp->ops.setup_pa_hsic(hw_dspp, hw_cfg);
-
-	return ret;
+		return -EINVAL;
+	if (hw_cfg->payload) {
+		if (hw_cfg->len != sizeof(hsic))
+			return -EINVAL;
+		hsic = *(struct drm_msm_pa_hsic *)hw_cfg->payload;
+	}
+	sde_kcal_merge_hsic(&hsic);
+	cfg.payload = hsic.flags ? &hsic : NULL;
+	cfg.len = hsic.flags ? sizeof(hsic) : 0;
+	hw_dspp->ops.setup_pa_hsic(hw_dspp, &cfg);
+	return 0;
 }
 
 
@@ -1492,6 +1501,7 @@ static void sde_cp_crtc_setfeature(struct sde_cp_node *prop_node,
 	u32 num_mixers = sde_crtc->num_mixers;
 	int i = 0, ret = 0;
 	bool feature_enabled = false;
+	u32 kcal_generation = sde_kcal_generation();
 	struct sde_mdss_cfg *catalog = NULL;
 
 	memset(&hw_cfg, 0, sizeof(hw_cfg));
@@ -1550,6 +1560,7 @@ static void sde_cp_crtc_setfeature(struct sde_cp_node *prop_node,
 			 prop_node->property_id);
 		list_del_init(&prop_node->active_list);
 	}
+	prop_node->kcal_generation = kcal_generation;
 	/* Programming of feature done remove from dirty list */
 	list_del_init(&prop_node->dirty_list);
 }
@@ -1805,6 +1816,33 @@ static int sde_cp_crtc_set_pu_features(struct drm_crtc *crtc, bool *need_flush)
 	return 0;
 }
 
+/* Called under crtc_cp_lock, with clocks and the display context active. */
+static void sde_cp_kcal_queue(struct sde_crtc *crtc)
+{
+	struct sde_cp_node *node;
+	u32 generation = sde_kcal_generation();
+
+	list_for_each_entry(node, &crtc->feature_list, feature_list) {
+		if (node->feature != SDE_CP_CRTC_DSPP_PCC &&
+		    node->feature != SDE_CP_CRTC_DSPP_HSIC)
+			continue;
+		if (node->kcal_generation == generation)
+			continue;
+		/* setfeature will re-add active properties after programming. */
+		list_del_init(&node->active_list);
+		list_del_init(&node->dirty_list);
+		sde_cp_update_list(node, crtc, true);
+	}
+}
+
+static void sde_cp_kcal_invalidate(struct sde_crtc *crtc)
+{
+	struct sde_cp_node *node;
+
+	list_for_each_entry(node, &crtc->feature_list, feature_list)
+		node->kcal_generation = 0;
+}
+
 void sde_cp_crtc_apply_properties(struct drm_crtc *crtc)
 {
 	struct sde_crtc *sde_crtc = NULL;
@@ -1834,6 +1872,7 @@ void sde_cp_crtc_apply_properties(struct drm_crtc *crtc)
 	}
 
 	mutex_lock(&sde_crtc->crtc_cp_lock);
+	sde_cp_kcal_queue(sde_crtc);
 
 	if (list_empty(&sde_crtc->dirty_list) &&
 			list_empty(&sde_crtc->ad_dirty) &&
@@ -2221,6 +2260,7 @@ void sde_cp_crtc_suspend(struct drm_crtc *crtc)
 	}
 
 	mutex_lock(&sde_crtc->crtc_cp_lock);
+	sde_cp_kcal_invalidate(sde_crtc);
 	list_for_each_entry_safe(prop_node, n, &sde_crtc->active_list,
 				 active_list) {
 		sde_cp_update_list(prop_node, sde_crtc, true);
@@ -2265,6 +2305,7 @@ void sde_cp_crtc_clear(struct drm_crtc *crtc)
 	}
 
 	mutex_lock(&sde_crtc->crtc_cp_lock);
+	sde_cp_kcal_invalidate(sde_crtc);
 	list_del_init(&sde_crtc->active_list);
 	list_del_init(&sde_crtc->dirty_list);
 	list_del_init(&sde_crtc->ad_active);
